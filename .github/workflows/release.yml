@@ -18,6 +18,13 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Check version.py matches the tag
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path version.py -Pattern '"([\d.]+)"').Matches[0].Groups[1].Value
+          if ("v$v" -ne "${{ github.ref_name }}") { throw "version.py says $v but the tag is ${{ github.ref_name }}" }
+
       - name: Build ArctisControl.exe
         shell: pwsh
         run: ./build.ps1

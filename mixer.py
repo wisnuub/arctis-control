@@ -390,8 +390,9 @@ class MixerPanel:
                                                          sticky="w", pady=(0, 4))
         on_power = getattr(self, "on_power", None)     # set by the badge: turn headset off
         if on_power:
-            power = tk.Frame(body, bg="#2d2d2d", cursor="hand2")
+            power = self.power = tk.Frame(body, bg="#2d2d2d", cursor="hand2")
             power.grid(row=0, column=2, sticky="e", pady=(0, 4))
+            self._show_power()
             parts = [tk.Label(power, text="Turn off", bg="#2d2d2d", fg="white", padx=6, pady=2,
                               cursor="hand2", font=(self.text_font, 8))]
             if self.icon_font:
@@ -462,11 +463,23 @@ class MixerPanel:
         if self.win and not self.menu_open and self.win.focus_get() is None:
             self.close()
 
+    def _show_power(self):
+        """Turn off only makes sense while the headset is on."""
+        power = getattr(self, "power", None)
+        if power is not None and power.winfo_exists():
+            on = bool(getattr(self, "is_connected", lambda: True)())
+            if on and not power.winfo_ismapped():
+                power.grid()
+            elif not on and power.winfo_ismapped():
+                power.grid_remove()
+
     def _meters(self, frame=0):
         if not self.win:
             return                    # panel closed: meters stop, zero cost
         if frame % (SWEEP_MS // METER_MS) == 0:
             self.meter_sources = self.m.channel_meters()
+        if frame % 30 == 0:
+            self._show_power()
         for key, row in self.rows.items():
             peak = 0.0
             for meter in self.meter_sources.get(key, []):

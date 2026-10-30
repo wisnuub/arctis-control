@@ -26,6 +26,7 @@ from tkinter import font as tkfont
 import hid
 from comtypes import CLSCTX_ALL
 from pycaw.pycaw import IAudioMeterInformation
+import updater
 from panels import (HealthPanel, SettingsWindow, find_monitor, load_settings, monitor_list,
                     save_settings)
 from dts import DTSController
@@ -600,6 +601,8 @@ class Badge:
         c.bind("<Button-1>", lambda e: self.toggle_mixer())
         c.bind("<Button-3>", self._menu)
         self.tip = None
+        self.menu_open = False
+        self.update_info = None
         self.icon_font, self.text_font = icon_font, text_font
         self.shown = None
         self.hidden = False
@@ -610,6 +613,8 @@ class Badge:
         self.dts = DTSController()
         self.panel = MixerPanel(root, self.mixer, self.dts, icon_font, text_font)
         self.panel.on_power = self.m.request_turn_off
+        self.panel.is_connected = lambda: bool(self.m.connected)
+        threading.Thread(target=self._update_loop, daemon=True).start()
         self.meters, self.quiet_since = {}, None
         root.after(2000, self.watch_activity)
         root.after(500, self.sweep)
@@ -686,8 +691,26 @@ class Badge:
         return [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
                 x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
 
+    def _update_loop(self):
+        """Once a day (first check a minute after start): newer GitHub release -> one popup."""
+        time.sleep(60)
+        while True:
+            if SETTINGS.get("check_updates", True):
+                try:
+                    info = updater.check()
+                    if info["newer"]:
+                        self.update_info = info
+                        if self.m.state.get("update_notified") != info["tag"]:
+                            self.m.state["update_notified"] = info["tag"]
+                            STATE_FILE.write_text(json.dumps(self.m.state), encoding="utf-8")
+                            self.m.popup("update", "Update available",
+                                         f"Arctis Control {info['tag']} · Settings > Update now", "on")
+                except Exception as e:
+                    logging.info("update check failed: %s", e)
+            time.sleep(24 * 3600)
+
     def raise_now(self):
-        if not self.hidden:
+        if not self.hidden and not self.menu_open:
             user32.SetWindowPos(self.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
 
@@ -727,8 +750,7 @@ class Badge:
                 self.root.deiconify()
                 self.hidden = False
             self.root.geometry(f"{BADGE_W}x{BADGE_H}+{x}+{y}")   # "+-188": a bare "-188" means "from the right edge"
-            user32.SetWindowPos(self.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-                                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+            self.raise_now()
         self.root.after(1000, self.place)
 
     def refresh(self):
@@ -851,11 +873,13 @@ class Badge:
         # A popup menu only closes on an outside click if its owner is the foreground
         # window, and the badge is WS_EX_NOACTIVATE so clicks never make it one.
         # Activating it explicitly (allowed right after the user's click) fixes that.
+        self.menu_open = True              # stop re-raising the badge over the menu
         user32.SetForegroundWindow(self.hwnd)
         try:
             menu.tk_popup(e.x_root, e.y_root)
         finally:
             menu.grab_release()
+            self.root.after(300, lambda: setattr(self, "menu_open", False))
 
     def set_badge_monitor(self, name):
         SETTINGS["badge_monitor"] = name
@@ -872,7 +896,8 @@ class Badge:
             test_popup=lambda mon: self.overlay("Headset battery low",
                                                 f"Arctis 7 · {level}% left (test)", "low",
                                                 mon=mon or foreground_monitor()),
-            icon=str(RES_DIR / "arctis_control.ico"), on_save=self.m.wake.set)
+            icon=str(RES_DIR / "arctis_control.ico"), on_save=self.m.wake.set,
+            on_quit=self.root.destroy)
 
     def show_health_panel(self):
         h = self.m.health

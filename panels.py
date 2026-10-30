@@ -6,11 +6,14 @@ load_settings() is shared and updated in place so the poller sees changes.
 """
 import ctypes
 import json
+import threading
 import tkinter as tk
 from ctypes import wintypes
 from pathlib import Path
 
+import updater
 from paths import DATA_DIR
+from version import __version__
 SETTINGS_FILE = DATA_DIR / "settings.json"
 
 POPUP_EVENTS = [  # key, label, default
@@ -22,6 +25,7 @@ POPUP_EVENTS = [  # key, label, default
     ("disconnected", "Headset turned off", True),
     ("charging", "Charger plugged in", False),
     ("unplugged", "Charger unplugged", False),
+    ("update", "Update available", True),
 ]
 DEFAULTS = {
     "badge_monitor": None,        # device name like \\.\DISPLAY2; None = first non-main screen
@@ -31,7 +35,8 @@ DEFAULTS = {
     # not by the headset's own timer, which is kept at "never" so it can't cut music.
     "auto_off": True,
     "auto_off_minutes": 30,
-    "auto_off_applied": False,    # False = set the headset's own timer to never on next connect
+    "auto_off_applied": False,
+    "check_updates": True,    # False = set the headset's own timer to never on next connect
 }
 AUTO_OFF_MAX = 240
 
@@ -112,8 +117,9 @@ def _button(parent, text, command, primary=False):
 class SettingsWindow:
     """Popup settings: which events show the popup, on which screen. Test / Save / Cancel."""
 
-    def __init__(self, root, settings, test_popup, icon, on_save=None):
+    def __init__(self, root, settings, test_popup, icon, on_save=None, on_quit=None):
         self.settings, self.test_popup, self.on_save = settings, test_popup, on_save
+        self.on_quit, self.update_info, self._result = on_quit, None, None
         win = self.win = tk.Toplevel(root, bg=BG)
         win.title("Arctis Control settings")
         win.resizable(False, False)
@@ -163,8 +169,24 @@ class SettingsWindow:
                  bg=BG, fg=DIM, font=("Segoe UI", 8)).grid(row=h + 2, column=0, columnspan=2,
                                                            sticky="w")
 
+        a = h + 3
+        tk.Label(body, text="About", bg=BG, fg="white",
+                 font=("Segoe UI", 10, "bold")).grid(row=a, column=0, columnspan=2,
+                                                     sticky="w", pady=(12, 0))
+        about = tk.Frame(body, bg=BG)
+        about.grid(row=a + 1, column=0, columnspan=2, sticky="we")
+        tk.Label(about, text=f"Arctis Control v{__version__}", bg=BG, fg="white",
+                 font=("Segoe UI", 9)).pack(side="left")
+        self.update_btn = _button(about, "Update now", self.update_now, primary=True)
+        _button(about, "Check for updates", self.check_updates).pack(side="right")
+        self.status = tk.Label(body, text="", bg=BG, fg=DIM, anchor="w", font=("Segoe UI", 8))
+        self.status.grid(row=a + 2, column=0, columnspan=2, sticky="w")
+        self.auto_update = tk.BooleanVar(value=settings.get("check_updates", True))
+        _dark_check(body, "Check for updates automatically (once a day)", self.auto_update).grid(
+            row=a + 3, column=0, columnspan=2, sticky="w")
+
         buttons = tk.Frame(body, bg=BG)
-        buttons.grid(row=h + 3, column=0, columnspan=2, sticky="e", pady=(16, 0))
+        buttons.grid(row=a + 4, column=0, columnspan=2, sticky="e", pady=(16, 0))
         _button(buttons, "Test", self.test).pack(side="left", padx=(0, 8))
         _button(buttons, "Cancel", win.destroy).pack(side="left", padx=(0, 8))
         _button(buttons, "Save", self.save, primary=True).pack(side="left")
@@ -177,6 +199,63 @@ class SettingsWindow:
         win.geometry(f"+{(l + rr - win.winfo_width()) // 2}+{(t + b - win.winfo_height()) // 2}")
         win.focus_force()
 
+    # --- updates (network work off the Tk thread, polled back in) ---------------
+    def check_updates(self):
+        self.status.config(text="Checking GitHub…")
+        self.update_btn.pack_forget()
+        self._result = None
+
+        def work():
+            try:
+                self._result = updater.check()
+            except Exception as e:
+                self._result = {"error": str(e)}
+        threading.Thread(target=work, daemon=True).start()
+        self.win.after(200, self._poll_check)
+
+    def _poll_check(self):
+        if not self.win.winfo_exists():
+            return
+        if self._result is None:
+            self.win.after(200, self._poll_check)
+            return
+        r = self._result
+        if "error" in r:
+            self.status.config(text="Couldn't reach GitHub. Try again later.")
+        elif r["newer"]:
+            self.update_info = r
+            self.status.config(text=f"{r['tag']} is available.")
+            self.update_btn.pack(side="right", padx=(8, 0))
+        else:
+            self.status.config(text="You're on the latest version.")
+
+    def update_now(self):
+        if not self.update_info:
+            return
+        self.status.config(text=f"Downloading {self.update_info['tag']}…")
+        self._result = None
+
+        def work():
+            try:
+                self._result = {"quit": updater.install(self.update_info)}
+            except Exception as e:
+                self._result = {"error": str(e)}
+        threading.Thread(target=work, daemon=True).start()
+        self.win.after(200, self._poll_install)
+
+    def _poll_install(self):
+        if not self.win.winfo_exists():
+            return
+        if self._result is None:
+            self.win.after(200, self._poll_install)
+        elif "error" in self._result:
+            self.status.config(text="Update failed. Download it from the Releases page instead.")
+        elif self._result["quit"] and self.on_quit:
+            self.status.config(text="Restarting with the new version…")
+            self.win.after(500, self.on_quit)       # swap script waits for us to exit
+        else:
+            self.status.config(text="Opened the release page in your browser.")
+
     def test(self):
         screen = self.screen.get()
         self.test_popup(None if screen == "active" else (find_monitor(screen) or {}).get("rect"))
@@ -184,6 +263,7 @@ class SettingsWindow:
     def save(self):
         self.settings["popups"] = {k: v.get() for k, v in self.vars.items()}
         self.settings["popup_monitor"] = self.screen.get()
+        self.settings["check_updates"] = self.auto_update.get()
         try:
             minutes = max(1, min(AUTO_OFF_MAX, int(self.minutes.get())))
         except ValueError:
