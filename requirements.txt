@@ -3,3 +3,5 @@ pycaw==20260927
 comtypes==1.4.17
 psutil==7.2.2
 winotify==1.1.0
+numpy==1.26.4
+sounddevice==0.5.6

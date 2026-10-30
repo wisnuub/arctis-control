@@ -310,7 +310,6 @@ class Slider:
         self.on_change, self.on_release = on_change, on_release
         y = 13
         self.c.create_line(self.PAD, y, self.W - self.PAD, y, fill=TRACK, width=4, capstyle="round")
-        # level meter: dim track + green / yellow / red segments (-60..-20, -20..-9, -9..0 dB)
         my, span = self.METER_Y, self.W - 2 * self.PAD
         self.c.create_rectangle(self.PAD, my, self.W - self.PAD, my + 2, fill="#2e2e2e", width=0)
         self.zones = [(self.PAD + span * a, self.PAD + span * b, color) for a, b, color in
@@ -318,6 +317,10 @@ class Slider:
         self.segs = [self.c.create_rectangle(x0, my, x0, my + 2, fill=color, width=0,
                                              state="hidden") for x0, _, color in self.zones]
         self.level = 0.0
+        # optional second meter (NC processed level): cyan bar at METER_Y + 4
+        self.nc_segs = [self.c.create_rectangle(x0, my + 4, x0, my + 6,
+                        fill="#40c8e0", width=0, state="hidden") for x0, _, _ in self.zones]
+        self.nc_level = 0.0
         self.fill = self.c.create_line(self.PAD, y, self.PAD, y, fill=ACCENT, width=4, capstyle="round")
         self.knob = self.c.create_oval(0, 0, 0, 0, fill="white", outline=ACCENT, width=3)
         self.c.bind("<Button-1>", self._drag)
@@ -352,6 +355,28 @@ class Slider:
                 self.c.coords(seg, x0, self.METER_Y, min(x, x1), self.METER_Y + 2)
                 self.c.itemconfig(seg, state="normal")
 
+    def show_nc_level(self, peak):
+        """Second meter bar showing NC-processed level (cyan)."""
+        db = 20 * math.log10(peak) if peak > 1e-6 else METER_FLOOR_DB
+        target = max(0.0, min(1.0, (db - METER_FLOOR_DB) / -METER_FLOOR_DB))
+        level = target if target > self.nc_level else max(target, self.nc_level - METER_FALL)
+        if abs(level - self.nc_level) < 0.002:
+            return
+        self.nc_level = level
+        my = self.METER_Y + 4
+        x = self.PAD + (self.W - 2 * self.PAD) * level
+        for seg, (x0, x1, _) in zip(self.nc_segs, self.zones):
+            if x <= x0:
+                self.c.itemconfig(seg, state="hidden")
+            else:
+                self.c.coords(seg, x0, my, min(x, x1), my + 2)
+                self.c.itemconfig(seg, state="normal")
+
+    def hide_nc_level(self):
+        for seg in self.nc_segs:
+            self.c.itemconfig(seg, state="hidden")
+        self.nc_level = 0.0
+
     def _drag(self, e):
         v = (e.x - self.PAD) / (self.W - 2 * self.PAD) * 100
         self.on_change(max(0, min(100, int(round(v)))))
@@ -365,8 +390,9 @@ class MixerPanel:
     """Popup above the battery badge. Closes on Esc, on clicking elsewhere, or on
     clicking the badge again."""
 
-    def __init__(self, root, mixer, dts, icon_font, text_font):
+    def __init__(self, root, mixer, dts, icon_font, text_font, nc=None):
         self.root, self.m, self.dts = root, mixer, dts     # dts: dts.DTSController
+        self.nc = nc                                        # noise_cancel.NoiseCanceller
         self.icon_font, self.text_font = icon_font, text_font
         self.win = None
         self.menu_open = False
@@ -442,6 +468,34 @@ class MixerPanel:
                 self.dts_buttons[key] = b
             self.paint_dts()
 
+        self.nc_buttons = {}
+        self.nc_hint_label = None
+        if self.nc and self.nc.available:
+            r = 2 + len(CHANNELS) * 2
+            if self.dts and self.dts.available:
+                r += 1
+            tk.Label(body, text="" if self.icon_font else "NC", bg=BG, fg="white",
+                     font=(self.icon_font or self.text_font, 14)).grid(row=r, column=0,
+                                                                      padx=(0, 8), pady=(12, 0))
+            tk.Label(body, text="Noise Cancel", bg=BG, fg="white", anchor="w",
+                     font=(self.text_font, 9)).grid(row=r, column=1, sticky="w", pady=(12, 0))
+            seg = tk.Frame(body, bg=BG)
+            seg.grid(row=r, column=2, sticky="e", pady=(12, 0))
+            for key, label in [("off", "Off"), ("on", "On")]:
+                b = tk.Label(seg, text=label, bg="#2d2d2d", fg="white", padx=7, pady=2,
+                             cursor="hand2", font=(self.text_font, 8))
+                b.pack(side="left", padx=(2, 0))
+                b.bind("<Button-1>", lambda e, k=key: self.pick_nc(k))
+                self.nc_buttons[key] = b
+            hint = self.nc.input_device_hint
+            if hint:
+                self.nc_hint_label = tk.Label(
+                    body, text=f"In-game mic: {hint}", bg=BG, fg="#7a7a7a",
+                    anchor="w", font=(self.text_font, 7))
+                self.nc_hint_label.grid(row=r + 1, column=1, columnspan=2,
+                                        sticky="w", pady=(1, 0))
+            self.paint_nc()
+
         win.update_idletasks()
         w, h = win.winfo_width(), win.winfo_height()
         win.geometry(f"+{anchor_right - w}+{anchor_top - h - 8}")
@@ -468,9 +522,12 @@ class MixerPanel:
         power = getattr(self, "power", None)
         if power is not None and power.winfo_exists():
             on = bool(getattr(self, "is_connected", lambda: True)())
-            if on and not power.winfo_ismapped():
+            # grid_info(), not winfo_ismapped(): while the panel is still being built nothing
+            # is mapped yet, so the button was never hidden until the next check (flash).
+            shown = bool(power.grid_info())
+            if on and not shown:
                 power.grid()
-            elif not on and power.winfo_ismapped():
+            elif not on and shown:
                 power.grid_remove()
 
     def _meters(self, frame=0):
@@ -487,7 +544,12 @@ class MixerPanel:
                     peak = max(peak, meter.GetPeakValue())
                 except Exception:
                     pass
-            row[2].show_level(0.0 if self.m.mute[key] else peak)
+            slider = row[2]
+            slider.show_level(0.0 if self.m.mute[key] else peak)
+            if key == "mic" and self.nc and self.nc.running:
+                slider.show_nc_level(self.nc.processed_peak)
+            elif key == "mic":
+                slider.hide_nc_level()
         self.win.after(METER_MS, self._meters, frame + 1)
 
     def close(self):
@@ -544,6 +606,23 @@ class MixerPanel:
         else:
             self.dts.set_preset(key)
         self.paint_dts()
+
+    def paint_nc(self):
+        if not self.nc_buttons:
+            return
+        on = self.nc and self.nc.running
+        for key, b in self.nc_buttons.items():
+            active = (key == "on") == on
+            b.config(bg=ACCENT if active else "#2d2d2d", fg="black" if active else "white")
+
+    def pick_nc(self, key):
+        if not self.nc:
+            return
+        if key == "on" and not self.nc.running:
+            self.nc.start()
+        elif key == "off" and self.nc.running:
+            self.nc.stop()
+        self.paint_nc()
 
     def change(self, key, value):
         self.m.set(key, value=value)

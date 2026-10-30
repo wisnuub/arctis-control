@@ -31,6 +31,7 @@ from panels import (HealthPanel, SettingsWindow, find_monitor, load_settings, mo
                     save_settings)
 from dts import DTSController
 from mixer import SWEEP_MS, Mixer, MixerPanel
+from noise_cancel import NoiseCanceller, was_enabled as nc_was_enabled
 from winotify import Notification, audio
 
 VID, PID = 0x1038, 0x12AD
@@ -611,7 +612,10 @@ class Badge:
         root.after(300, self._poll_show)
         self.mixer = Mixer()
         self.dts = DTSController()
-        self.panel = MixerPanel(root, self.mixer, self.dts, icon_font, text_font)
+        self.nc = NoiseCanceller()
+        if self.nc.available and nc_was_enabled():      # it was on when the app last closed
+            self.nc.start()
+        self.panel = MixerPanel(root, self.mixer, self.dts, icon_font, text_font, nc=self.nc)
         self.panel.on_power = self.m.request_turn_off
         self.panel.is_connected = lambda: bool(self.m.connected)
         threading.Thread(target=self._update_loop, daemon=True).start()
@@ -783,6 +787,11 @@ class Badge:
                                        text=f"{shown_level}%" if shown_level is not None else "–")
             if not self.tip:
                 self.canvas.itemconfig(self.bg, fill=self.base)
+        if self.nc and self.nc.running:              # no DSP while the headset is off
+            if self.m.connected:
+                self.nc.resume()
+            elif self.m.connected is False:
+                self.nc.pause()
         while not self.m.overlays.empty():
             self.overlay(*self.m.overlays.get())
         self.root.after(1000, self.refresh)
@@ -843,7 +852,8 @@ class Badge:
             dts_line = f"\nDTS: {self.dts.preset_label}" if self.dts.enabled else "\nDTS: Off"
         else:
             dts_line = ""
-        tk.Label(self.tip, text=f"Arctis 7\n{self.m.status_text()}\n{health_text(self.m.health)}{dts_line}",
+        nc_line = "\nNoise Cancel: On" if self.nc and self.nc.running else ""
+        tk.Label(self.tip, text=f"Arctis 7\n{self.m.status_text()}\n{health_text(self.m.health)}{dts_line}{nc_line}",
                  justify="left", bg="#2b2b2b", fg="white", padx=10, pady=6,
                  font=("Segoe UI", 9)).pack()
         self.tip.update_idletasks()
@@ -916,7 +926,13 @@ class Badge:
 
     def run(self):
         threading.Thread(target=self.m.loop, daemon=True).start()
-        self.root.mainloop()
+        try:
+            self.root.mainloop()
+        finally:
+            # The virtual mic is silent without us: hand Windows back the Arctis mic,
+            # but remember noise cancelling was on so it resumes next launch.
+            if self.nc and self.nc.running:
+                self.nc.stop(remember=False)
 
 
 def register_app_id():
