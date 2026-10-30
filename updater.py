@@ -68,7 +68,12 @@ Start-Process -FilePath "{install_dir / "ArctisControl.exe"}" -ArgumentList "--b
 Start-Sleep 2
 Remove-Item -Path "{work}" -Recurse -Force
 ''', encoding="utf-8")
-    subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                      "-WindowStyle", "Hidden", "-File", str(script)],
-                     creationflags=0x08000000 | 0x00000008)   # no window, detached
+    # CREATE_NO_WINDOW gives PowerShell a hidden console (DETACHED_PROCESS gives it none,
+    # and it quits). New process group so it outlives us; break away from any job object.
+    cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)]
+    flags = 0x08000000 | 0x00000200                           # no window, new process group
+    try:
+        subprocess.Popen(cmd, creationflags=flags | 0x01000000)   # + breakaway from job
+    except OSError:
+        subprocess.Popen(cmd, creationflags=flags)
     return True
