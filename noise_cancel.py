@@ -18,6 +18,7 @@ from pathlib import Path
 import numpy as np
 import sounddevice as sd
 
+from enhancer import Enhancer
 from paths import DATA_DIR, RES_DIR
 
 log = logging.getLogger(__name__)
@@ -150,8 +151,21 @@ def was_enabled() -> bool:
         return False
 
 
-def _remember(enabled: bool):
-    STATE_FILE.write_text(json.dumps({"enabled": enabled}), encoding="utf-8")
+def _load_state() -> dict:
+    try:
+        return json.loads(STATE_FILE.read_text(encoding="utf-8-sig"))
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def _remember(enabled: bool = None, enhance: str = None):
+    """Merge into noise_cancel.json: {"enabled": bool, "enhance": preset}."""
+    state = _load_state()
+    if enabled is not None:
+        state["enabled"] = enabled
+    if enhance is not None:
+        state["enhance"] = enhance
+    STATE_FILE.write_text(json.dumps(state), encoding="utf-8")
 
 
 def _wasapi_settings(in_dev, out_dev):
@@ -199,6 +213,7 @@ class NoiseCanceller:
 
         self._raw_peak = 0.0
         self._proc_peak = 0.0
+        self.enhancer = Enhancer(_load_state().get("enhance", "off"))   # experimental voice chain
 
         self._init()
 
@@ -314,10 +329,18 @@ class NoiseCanceller:
         self._in_buf[:n] = indata[:n, 0]
         raw = float(np.max(np.abs(self._in_buf[:n])))
         self._desc.run(self._instance, n)
-        proc = float(np.max(np.abs(self._out_buf[:n])))
+        out = self._out_buf[:n]
+        enhancer = self.enhancer                  # read once: the UI may swap it
+        if enhancer.preset != "off":
+            try:
+                out = enhancer.process(out)
+            except Exception as e:                # never let the voice chain kill the mic
+                log.warning("NC: enhancer failed, disabling: %s", e)
+                self.enhancer = Enhancer("off")
+        proc = float(np.max(np.abs(out)))
         self._raw_peak = raw
         self._proc_peak = proc
-        outdata[:n, 0] = self._out_buf[:n]
+        outdata[:n, 0] = out
 
     def start(self):
         with self._lock:
@@ -376,6 +399,16 @@ class NoiseCanceller:
             except Exception as e:
                 log.warning("NC: default mic switch failed: %s", e)
             log.info("NC: stopped")
+
+    @property
+    def enhance_preset(self):
+        return self.enhancer.preset
+
+    def set_enhance(self, preset: str):
+        """Swap the voice chain (fresh filter state); applies while noise cancel runs."""
+        self.enhancer = Enhancer(preset)
+        _remember(enhance=self.enhancer.preset)
+        log.info("NC: mic enhancement -> %s", self.enhancer.preset)
 
     def pause(self):
         """Headset off: stop the DSP (it costs ~30% of a core even on silence) but keep

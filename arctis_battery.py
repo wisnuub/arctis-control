@@ -644,9 +644,15 @@ class Badge:
         else:
             self.toggle_mixer()
 
+    def panel_anchor(self):
+        """Bottom-right corner panels open above: where the badge belongs, not where its
+        window is (it's withdrawn at 0,0 while something is fullscreen on that screen)."""
+        x, y, _ = badge_position()
+        return x + BADGE_W, y
+
     def toggle_mixer(self):
         self._leave(None)
-        self.panel.toggle(self.root.winfo_rootx() + BADGE_W, self.root.winfo_rooty())
+        self.panel.toggle(*self.panel_anchor())
 
     def sweep(self):
         try:
@@ -922,7 +928,7 @@ class Badge:
             rows.append(("Drop after unplugging",
                          f"~{h['unplug_drop']:.0f}% (healthy: a few %)"))
         rows.append(("Now", self.m.status_text()))
-        HealthPanel(self.root, self.root.winfo_rootx() + BADGE_W, self.root.winfo_rooty(), rows)
+        HealthPanel(self.root, *self.panel_anchor(), rows)
 
     def run(self):
         threading.Thread(target=self.m.loop, daemon=True).start()

@@ -496,6 +496,28 @@ class MixerPanel:
                                         sticky="w", pady=(1, 0))
             self.paint_nc()
 
+            # experimental voice chain (enhancer.py), runs after DeepFilterNet
+            from enhancer import PRESETS as ENHANCE_PRESETS
+            e = r + 2
+            tk.Label(body, text="\uE720" if self.icon_font else "", bg=BG, fg="white",
+                     font=(self.icon_font or self.text_font, 14)).grid(row=e, column=0,
+                                                                      padx=(0, 8), pady=(8, 0))
+            tk.Label(body, text="Mic enhance (beta)", bg=BG, fg="white", anchor="w",
+                     font=(self.text_font, 9)).grid(row=e, column=1, sticky="w", pady=(8, 0))
+            seg = tk.Frame(body, bg=BG)
+            seg.grid(row=e, column=2, sticky="e", pady=(8, 0))
+            self.enh_buttons = {}
+            for key, label in ENHANCE_PRESETS:
+                b = tk.Label(seg, text=label, bg="#2d2d2d", fg="white", padx=7, pady=2,
+                             cursor="hand2", font=(self.text_font, 8))
+                b.pack(side="left", padx=(2, 0))
+                b.bind("<Button-1>", lambda ev, k=key: self.pick_enhance(k))
+                self.enh_buttons[key] = b
+            self.enh_hint = tk.Label(body, text="", bg=BG, fg="#7a7a7a", anchor="w",
+                                     font=(self.text_font, 7))
+            self.enh_hint.grid(row=e + 1, column=1, columnspan=2, sticky="w", pady=(1, 0))
+            self.paint_enhance()
+
         win.update_idletasks()
         w, h = win.winfo_width(), win.winfo_height()
         win.geometry(f"+{anchor_right - w}+{anchor_top - h - 8}")
@@ -623,6 +645,21 @@ class MixerPanel:
         elif key == "off" and self.nc.running:
             self.nc.stop()
         self.paint_nc()
+        self.paint_enhance()
+
+    def paint_enhance(self):
+        if not getattr(self, "enh_buttons", None):
+            return
+        cur = self.nc.enhance_preset
+        for key, b in self.enh_buttons.items():
+            on = key == cur
+            b.config(bg=ACCENT if on else "#2d2d2d", fg="black" if on else "white")
+        self.enh_hint.config(text="" if self.nc.running or cur == "off"
+                             else "Applies while Noise Cancel is on")
+
+    def pick_enhance(self, key):
+        self.nc.set_enhance(key)
+        self.paint_enhance()
 
     def change(self, key, value):
         self.m.set(key, value=value)

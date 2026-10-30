@@ -10,6 +10,7 @@ A small Windows 11 replacement for SteelSeries GG, built for the **SteelSeries A
 - **DTS Headphone:X** presets (Off / Game / Music / Movie), using the DTS driver that was installed with the headset.
 - **Auto-off**: turns the headset off after N minutes with no sound and no mic input, and a **Turn off** button in the mixer.
 - **Noise cancelling** for your mic with [DeepFilterNet](https://github.com/Rikorose/DeepFilterNet), similar to Krisp, for every app (needs the free VB-CABLE driver, see below).
+- **Mic enhance (beta)**: an optional voice chain after noise cancelling (low cut, warmth and presence EQ, de-esser, compressor, a subtle exciter and a limiter) with **Natural** and **Broadcast** presets. The Arctis 7 mic itself only records up to about 7 kHz, so this makes it sound fuller and clearer rather than truly studio grade.
 - **Battery health estimate**: hours per full charge compared with the rated 24 h, sudden voltage drops, and how far the reading falls after unplugging.
 
 ## Install
