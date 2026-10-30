@@ -1,0 +1,17 @@
+# Python / build
+.venv/
+__pycache__/
+build/
+dist/
+*.spec
+
+# Personal runtime data (now kept in %APPDATA%\ArctisControl)
+*.log
+history.csv
+state.json
+settings.json
+mixer_state.json
+mixer_apps.json
+
+# Copies of DTS's proprietary driver config: not ours to publish
+dts_apo4_*.xml*

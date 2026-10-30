@@ -1,0 +1,41 @@
+name: Build and release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build ArctisControl.exe
+        shell: pwsh
+        run: ./build.ps1
+
+      - name: Zip
+        shell: pwsh
+        run: Compress-Archive -Path dist/ArctisControl/* -DestinationPath "ArctisControl-${{ github.ref_name }}-win64.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ArctisControl-${{ github.ref_name }}
+          path: ArctisControl-*.zip
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "${{ github.ref_name }}" "ArctisControl-${{ github.ref_name }}-win64.zip"
+          --title "Arctis Control ${{ github.ref_name }}" --generate-notes

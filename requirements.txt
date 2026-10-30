@@ -1,0 +1,5 @@
+hidapi==0.15.0
+pycaw==20260927
+comtypes==1.4.17
+psutil==7.2.2
+winotify==1.1.0
