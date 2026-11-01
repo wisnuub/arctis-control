@@ -1,7 +1,7 @@
 """
-Settings + small windows for Arctis Control: which monitor the badge sits on,
-which events show the Steam-style popup and on which screen, the headset's own
-auto-off timer, and the battery health panel. Settings live in settings.json; the dict returned by
+Settings + small windows for Arctis Control: which events show the Steam-style popup
+and on which screen, which monitor the badge sits on, auto-off, updates, battery
+health and a log of readings; plus the small battery health panel. Settings live in settings.json; the dict returned by
 load_settings() is shared and updated in place so the poller sees changes.
 """
 import ctypes
@@ -114,10 +114,24 @@ def _button(parent, text, command, primary=False):
     return b
 
 
-class SettingsWindow:
-    """Popup settings: which events show the popup, on which screen. Test / Save / Cancel."""
+def _heading(parent, text, row, top=12, colspan=2):
+    tk.Label(parent, text=text, bg=BG, fg="white", font=("Segoe UI", 10, "bold")).grid(
+        row=row, column=0, columnspan=colspan, sticky="w", pady=(top, 0))
 
-    def __init__(self, root, settings, test_popup, icon, on_save=None, on_quit=None):
+
+def _subheading(parent, text, row):
+    tk.Label(parent, text=text, bg=BG, fg=DIM, font=("Segoe UI", 9)).grid(
+        row=row, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+
+class SettingsWindow:
+    """Popups (events, screen, test), the battery widget's screen, headset auto-off,
+    updates, and battery health with a log of recent readings. Cancel / Apply / Save.
+
+    health_rows: [(label, value)]; battery_log: [(text, dim)] newest first."""
+
+    def __init__(self, root, settings, test_popup, icon, on_save=None, on_quit=None,
+                 health_rows=(), battery_log=()):
         self.settings, self.test_popup, self.on_save = settings, test_popup, on_save
         self.on_quit, self.update_info, self._result = on_quit, None, None
         win = self.win = tk.Toplevel(root, bg=BG)
@@ -126,32 +140,47 @@ class SettingsWindow:
         win.attributes("-topmost", True)
         if icon:
             win.iconbitmap(icon)
-        body = tk.Frame(win, bg=BG, padx=18, pady=14)
-        body.pack()
+        outer = tk.Frame(win, bg=BG, padx=18, pady=14)
+        outer.pack()
+        body = tk.Frame(outer, bg=BG)
+        body.grid(row=0, column=0, sticky="n")
+        side = tk.Frame(outer, bg=BG)
+        side.grid(row=0, column=1, sticky="ns", padx=(28, 0))
+        mons = monitor_list()
 
-        tk.Label(body, text="Show a popup when", bg=BG, fg="white",
-                 font=("Segoe UI", 10, "bold")).grid(row=0, column=0, columnspan=2, sticky="w")
+        # popups
+        _heading(body, "Show a popup when", 0, top=0)
         self.vars = {}
         for i, (key, label, _) in enumerate(POPUP_EVENTS):
             v = self.vars[key] = tk.BooleanVar(value=settings["popups"].get(key, False))
             _dark_check(body, label, v).grid(row=1 + i // 2, column=i % 2, sticky="w",
                                               padx=(0, 18), pady=1)
-
         r = 2 + len(POPUP_EVENTS) // 2
-        tk.Label(body, text="Show it on", bg=BG, fg="white",
-                 font=("Segoe UI", 10, "bold")).grid(row=r, column=0, columnspan=2,
-                                                     sticky="w", pady=(12, 0))
+        _subheading(body, "Show popups on", r)
         self.screen = tk.StringVar(value=settings.get("popup_monitor") or "active")
         _dark_radio(body, "The screen I'm using (active window)", self.screen, "active").grid(
             row=r + 1, column=0, columnspan=2, sticky="w")
-        for j, m in enumerate(monitor_list()):
+        for j, m in enumerate(mons):
             _dark_radio(body, m["label"], self.screen, m["name"]).grid(
                 row=r + 2 + j, column=0, columnspan=2, sticky="w")
+        r += 2 + len(mons)
+        _button(body, "Test popup", self.test).grid(row=r, column=0, sticky="w", pady=(6, 0))
 
-        h = r + 3 + len(monitor_list())
-        tk.Label(body, text="Headset", bg=BG, fg="white",
-                 font=("Segoe UI", 10, "bold")).grid(row=h, column=0, columnspan=2,
-                                                     sticky="w", pady=(12, 0))
+        # battery widget
+        r += 1
+        _heading(body, "Battery widget", r)
+        _subheading(body, "Show it on", r + 1)
+        badge = settings.get("badge_monitor")
+        if not any(m["name"] == badge for m in mons):
+            badge = next((m["name"] for m in mons if not m["primary"]), mons[0]["name"])
+        self.badge_screen = tk.StringVar(value=badge)
+        for j, m in enumerate(mons):
+            _dark_radio(body, m["label"], self.badge_screen, m["name"]).grid(
+                row=r + 2 + j, column=0, columnspan=2, sticky="w")
+
+        # headset
+        h = r + 2 + len(mons)
+        _heading(body, "Headset", h)
         row = tk.Frame(body, bg=BG)
         row.grid(row=h + 1, column=0, columnspan=2, sticky="w")
         self.auto_off = tk.BooleanVar(value=settings.get("auto_off", True))
@@ -169,10 +198,9 @@ class SettingsWindow:
                  bg=BG, fg=DIM, font=("Segoe UI", 8)).grid(row=h + 2, column=0, columnspan=2,
                                                            sticky="w")
 
+        # about
         a = h + 3
-        tk.Label(body, text="About", bg=BG, fg="white",
-                 font=("Segoe UI", 10, "bold")).grid(row=a, column=0, columnspan=2,
-                                                     sticky="w", pady=(12, 0))
+        _heading(body, "About", a)
         about = tk.Frame(body, bg=BG)
         about.grid(row=a + 1, column=0, columnspan=2, sticky="we")
         tk.Label(about, text=f"Arctis Control v{__version__}", bg=BG, fg="white",
@@ -185,16 +213,38 @@ class SettingsWindow:
         _dark_check(body, "Check for updates automatically (once a day)", self.auto_update).grid(
             row=a + 3, column=0, columnspan=2, sticky="w")
 
-        buttons = tk.Frame(body, bg=BG)
-        buttons.grid(row=a + 4, column=0, columnspan=2, sticky="e", pady=(16, 0))
-        _button(buttons, "Test", self.test).pack(side="left", padx=(0, 8))
+        # battery health + log
+        _heading(side, "Battery health", 0, top=0)
+        for i, (k, v) in enumerate(health_rows, start=1):
+            tk.Label(side, text=k, bg=BG, fg=DIM, anchor="nw", font=("Segoe UI", 9)).grid(
+                row=i, column=0, sticky="nw", padx=(0, 14), pady=1)
+            tk.Label(side, text=v, bg=BG, fg="white", anchor="w", justify="left",
+                     wraplength=210, font=("Segoe UI", 9)).grid(row=i, column=1, sticky="w",
+                                                                pady=1)
+        g = len(health_rows) + 1
+        _heading(side, "Battery log", g)
+        tk.Label(side, text="Changes in level or charger, newest first", bg=BG, fg=DIM,
+                 font=("Segoe UI", 8)).grid(row=g + 1, column=0, columnspan=2, sticky="w")
+        log = tk.Text(side, width=40, height=1, bg=PANEL, fg="white", relief="flat", wrap="none",
+                      padx=8, pady=6, cursor="arrow", highlightthickness=0,
+                      font=("Segoe UI", 9))
+        log.tag_configure("dim", foreground=DIM)
+        for text, dim in battery_log or [("No readings yet", True)]:
+            log.insert("end", text + "\n", "dim" if dim else ())
+        log.config(state="disabled")
+        log.grid(row=g + 2, column=0, columnspan=2, sticky="nsew", pady=(4, 0))
+        side.grid_rowconfigure(g + 2, weight=1)   # the log stretches to the left column
+
+        buttons = tk.Frame(outer, bg=BG)
+        buttons.grid(row=1, column=0, columnspan=2, sticky="e", pady=(16, 0))
         _button(buttons, "Cancel", win.destroy).pack(side="left", padx=(0, 8))
+        _button(buttons, "Apply", self.apply).pack(side="left", padx=(0, 8))
         _button(buttons, "Save", self.save, primary=True).pack(side="left")
         win.bind("<Escape>", lambda e: win.destroy())
 
         win.update_idletasks()
         mon = find_monitor(settings.get("badge_monitor") or "") or next(
-            (m for m in monitor_list() if not m["primary"]), monitor_list()[0])
+            (m for m in mons if not m["primary"]), mons[0])
         l, t, rr, b = mon["work"]
         win.geometry(f"+{(l + rr - win.winfo_width()) // 2}+{(t + b - win.winfo_height()) // 2}")
         win.focus_force()
@@ -260,19 +310,25 @@ class SettingsWindow:
         screen = self.screen.get()
         self.test_popup(None if screen == "active" else (find_monitor(screen) or {}).get("rect"))
 
-    def save(self):
+    def apply(self):
         self.settings["popups"] = {k: v.get() for k, v in self.vars.items()}
         self.settings["popup_monitor"] = self.screen.get()
+        self.settings["badge_monitor"] = self.badge_screen.get()
         self.settings["check_updates"] = self.auto_update.get()
         try:
             minutes = max(1, min(AUTO_OFF_MAX, int(self.minutes.get())))
         except ValueError:
             minutes = self.settings.get("auto_off_minutes", 30)
         self.settings["auto_off"], self.settings["auto_off_minutes"] = self.auto_off.get(), minutes
+        self.minutes.delete(0, "end")
+        self.minutes.insert(0, str(minutes))
         save_settings(self.settings)
-        self.win.destroy()
         if self.on_save:
             self.on_save()
+
+    def save(self):
+        self.apply()
+        self.win.destroy()
 
 
 class HealthPanel:

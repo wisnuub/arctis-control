@@ -240,6 +240,24 @@ def health_text(h):
             f"(rated {RATED_HOURS} h){sag}{unplug}")
 
 
+def battery_log(rows, limit=300):
+    """[(text, dim)] newest first: readings where the level or charger changed, with
+    the gaps where the headset was off (or the app closed) marked."""
+    def span(sec):
+        return f"{sec / 3600:.0f} h" if sec >= 5400 else f"{sec / 60:.0f} min"
+
+    out, prev = [], None
+    for t, lvl, charging in rows:
+        gap = prev and t - prev[0] > GAP_SECONDS
+        if gap:
+            out.append((f"      off for {span(t - prev[0])}", True))
+        if not prev or gap or lvl != prev[1] or charging != prev[2]:
+            stamp = datetime.fromtimestamp(t).strftime("%a %d %b  %H:%M")
+            out.append((f"{stamp}    {lvl}%{'    charging' if charging else ''}", False))
+        prev = (t, lvl, charging)
+    return out[::-1][:limit]
+
+
 def battery_glyph(level, charging):
     """Segoe Fluent battery icons: E850-E859 + E83F (full), charging E85A-E863 + E83E."""
     n = max(0, min(10, round((level or 0) / 10)))
@@ -323,7 +341,7 @@ def tray_left():
 
 
 def badge_monitor():
-    """Monitor chosen under right-click > Position; default the first non-main screen."""
+    """Monitor chosen in Settings or right-click > Position; default the first non-main screen."""
     mons = monitor_list()
     return (next((m for m in mons if m["name"] == SETTINGS.get("badge_monitor")), None)
             or next((m for m in mons if not m["primary"]), mons[0]))
@@ -913,9 +931,13 @@ class Badge:
                                                 f"Arctis 7 · {level}% left (test)", "low",
                                                 mon=mon or foreground_monitor()),
             icon=str(RES_DIR / "arctis_control.ico"), on_save=self.m.wake.set,
-            on_quit=self.root.destroy)
+            on_quit=self.root.destroy, health_rows=self.health_rows(),
+            battery_log=battery_log(load_history()))
 
     def show_health_panel(self):
+        HealthPanel(self.root, *self.panel_anchor(), self.health_rows())
+
+    def health_rows(self):
         h = self.m.health
         rows = [("Verdict", h.get("verdict", "collecting data").capitalize())]
         if "runtime" in h:
@@ -928,7 +950,7 @@ class Badge:
             rows.append(("Drop after unplugging",
                          f"~{h['unplug_drop']:.0f}% (healthy: a few %)"))
         rows.append(("Now", self.m.status_text()))
-        HealthPanel(self.root, *self.panel_anchor(), rows)
+        return rows
 
     def run(self):
         threading.Thread(target=self.m.loop, daemon=True).start()
