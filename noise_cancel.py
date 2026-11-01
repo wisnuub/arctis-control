@@ -1,5 +1,6 @@
 """
-Real-time noise cancellation via DeepFilterNet LADSPA plugin.
+Real-time noise cancellation with DeepFilterNet3 (deepfilter.py, ONNX Runtime on the
+CPU or, if picked, the GPU through DirectML).
 
 Pipeline: Arctis 7 Chat mic -> DeepFilterNet -> VB-CABLE ("CABLE Input" playback),
 which comes back out of VB-CABLE's recording side as a clean virtual mic. While it
@@ -9,15 +10,14 @@ is remembered between launches. VB-CABLE (free donationware, vb-cable.com) must 
 installed by the user: its licence doesn't allow bundling it. Voicemeeter works too.
 The mixer shows raw vs processed levels on the Mic meter bar.
 """
-import ctypes
 import json
 import logging
 import threading
-from pathlib import Path
 
 import numpy as np
 import sounddevice as sd
 
+from deepfilter import DeepFilter, available_devices
 from enhancer import Enhancer
 from paths import DATA_DIR, RES_DIR
 
@@ -25,7 +25,7 @@ log = logging.getLogger(__name__)
 
 SAMPLE_RATE = 48000
 FRAME_SIZE = 480  # 10 ms at 48 kHz
-DLL_NAME = "deep_filter_ladspa.dll"
+MODEL = RES_DIR / "models" / "dfn3_stream.onnx"
 STATE_FILE = DATA_DIR / "noise_cancel.json"
 CABLE_DRIVER = "VB-Audio Virtual Cable"      # stays in the name even if the endpoint is renamed
 SOURCE_MIC = "Arctis 7 Chat"
@@ -37,49 +37,6 @@ VIRTUAL_OUTPUT_NAMES = [
     "Voicemeeter Point 2",
     "Voicemeeter VAIO",
 ]
-
-
-class _LADSPA_PortRangeHint(ctypes.Structure):
-    _fields_ = [
-        ("HintDescriptor", ctypes.c_int),
-        ("LowerBound", ctypes.c_float),
-        ("UpperBound", ctypes.c_float),
-    ]
-
-
-class _LADSPA_Descriptor(ctypes.Structure):
-    _fields_ = [
-        ("UniqueID", ctypes.c_ulong),
-        ("Label", ctypes.c_char_p),
-        ("Properties", ctypes.c_int),
-        ("Name", ctypes.c_char_p),
-        ("Maker", ctypes.c_char_p),
-        ("Copyright", ctypes.c_char_p),
-        ("PortCount", ctypes.c_ulong),
-        ("PortDescriptors", ctypes.POINTER(ctypes.c_int)),
-        ("PortNames", ctypes.POINTER(ctypes.c_char_p)),
-        ("PortRangeHints", ctypes.POINTER(_LADSPA_PortRangeHint)),
-        ("ImplementationData", ctypes.c_void_p),
-        ("instantiate", ctypes.CFUNCTYPE(
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong)),
-        ("connect_port", ctypes.CFUNCTYPE(
-            None, ctypes.c_void_p, ctypes.c_ulong,
-            ctypes.POINTER(ctypes.c_float))),
-        ("activate", ctypes.CFUNCTYPE(None, ctypes.c_void_p)),
-        ("run", ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_ulong)),
-        ("run_adding", ctypes.c_void_p),
-        ("set_run_adding_gain", ctypes.c_void_p),
-        ("deactivate", ctypes.CFUNCTYPE(None, ctypes.c_void_p)),
-        ("cleanup", ctypes.CFUNCTYPE(None, ctypes.c_void_p)),
-    ]
-
-
-def _find_dll() -> Path:
-    for p in (RES_DIR / DLL_NAME, Path(__file__).parent / DLL_NAME):
-        if p.exists():
-            return p
-    raise FileNotFoundError(
-        f"{DLL_NAME} not found in {RES_DIR} or {Path(__file__).parent}")
 
 
 def _find_device(name_fragment: str, kind: str,
@@ -158,13 +115,15 @@ def _load_state() -> dict:
         return {}
 
 
-def _remember(enabled: bool = None, enhance: str = None):
-    """Merge into noise_cancel.json: {"enabled": bool, "enhance": preset}."""
+def _remember(enabled: bool = None, enhance: str = None, gpu: bool = None):
+    """Merge into noise_cancel.json: {"enabled": bool, "enhance": preset, "gpu": bool}."""
     state = _load_state()
     if enabled is not None:
         state["enabled"] = enabled
     if enhance is not None:
         state["enhance"] = enhance
+    if gpu is not None:
+        state["gpu"] = gpu
     STATE_FILE.write_text(json.dumps(state), encoding="utf-8")
 
 
@@ -179,7 +138,7 @@ def _wasapi_settings(in_dev, out_dev):
 class NoiseCanceller:
     """Real-time noise cancellation engine.
 
-    Captures Arctis mic -> LADSPA DeepFilterNet -> virtual audio output.
+    Captures Arctis mic -> DeepFilterNet -> virtual audio output.
     Exposes raw_peak / processed_peak for the mixer level meter.
     """
 
@@ -189,21 +148,10 @@ class NoiseCanceller:
         self._running = False
         self._paused = False
         self._stream = None
-        self._instance = None
-        self._desc = None
-        self._desc_ptr = None
-        self._dll = None
+        self._engine = None
         self._err = None
-
-        self._in_buf = np.zeros(FRAME_SIZE, dtype=np.float32)
-        self._out_buf = np.zeros(FRAME_SIZE, dtype=np.float32)
-
-        self._atten_limit = ctypes.c_float(100.0)
-        self._min_thresh = ctypes.c_float(-10.0)
-        self._max_erb = ctypes.c_float(30.0)
-        self._max_df = ctypes.c_float(20.0)
-        self._min_proc_buf = ctypes.c_float(0.0)
-        self._post_beta = ctypes.c_float(0.02)
+        state = _load_state()
+        self._gpu = bool(state.get("gpu")) and "GPU" in available_devices()
 
         self._input_dev = None
         self._output_dev = None
@@ -213,26 +161,13 @@ class NoiseCanceller:
 
         self._raw_peak = 0.0
         self._proc_peak = 0.0
-        self.enhancer = Enhancer(_load_state().get("enhance", "off"))   # experimental voice chain
+        self.enhancer = Enhancer(state.get("enhance", "off"))   # experimental voice chain
 
         self._init()
 
     def _init(self):
-        try:
-            dll_path = _find_dll()
-            self._dll = ctypes.CDLL(str(dll_path))
-            get_desc = self._dll.ladspa_descriptor
-            get_desc.restype = ctypes.POINTER(_LADSPA_Descriptor)
-            get_desc.argtypes = [ctypes.c_ulong]
-            self._desc_ptr = get_desc(0)
-            if not self._desc_ptr:
-                self._err = "no LADSPA descriptor"
-                return
-            self._desc = self._desc_ptr.contents
-            log.info("NC: loaded %s (%s)", self._desc.Name.decode(),
-                     dll_path.name)
-        except Exception as e:
-            self._err = f"DLL load failed: {e}"
+        if not MODEL.exists():
+            self._err = f"model missing: {MODEL}"
             log.warning("NC: %s", self._err)
             return
 
@@ -282,6 +217,24 @@ class NoiseCanceller:
         return self._paired_input_name
 
     @property
+    def device(self):
+        """"CPU" or "GPU": what inference runs on (GPU falls back to CPU if it fails)."""
+        engine = self._engine
+        return engine.device if engine else ("GPU" if self._gpu else "CPU")
+
+    @property
+    def gpu_available(self):
+        return "GPU" in available_devices()
+
+    def set_gpu(self, on: bool):
+        """Pick CPU or GPU inference; swaps the engine live if noise cancel is running."""
+        self._gpu = on
+        _remember(gpu=on)
+        if self._running:
+            self._engine = self._make_engine()   # the audio thread picks it up next frame
+        log.info("NC: inference on %s", self.device)
+
+    @property
     def raw_peak(self) -> float:
         return self._raw_peak
 
@@ -289,47 +242,29 @@ class NoiseCanceller:
     def processed_peak(self) -> float:
         return self._proc_peak
 
-    def _create_instance(self):
-        inst = self._desc.instantiate(self._desc_ptr, SAMPLE_RATE)
-        if not inst:
-            raise RuntimeError("LADSPA instantiate returned NULL")
-
-        d = self._desc
-        in_ptr = self._in_buf.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
-        out_ptr = self._out_buf.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
-        d.connect_port(inst, 0, in_ptr)
-        d.connect_port(inst, 1, out_ptr)
-        d.connect_port(inst, 2, ctypes.pointer(self._atten_limit))
-        d.connect_port(inst, 3, ctypes.pointer(self._min_thresh))
-        d.connect_port(inst, 4, ctypes.pointer(self._max_erb))
-        d.connect_port(inst, 5, ctypes.pointer(self._max_df))
-        d.connect_port(inst, 6, ctypes.pointer(self._min_proc_buf))
-        d.connect_port(inst, 7, ctypes.pointer(self._post_beta))
-        d.activate(inst)
-
-        for _ in range(5):
-            d.run(inst, FRAME_SIZE)
-        self._out_buf[:] = 0.0
-
-        return inst
-
-    def _destroy_instance(self):
-        if self._instance and self._desc:
+    def _make_engine(self):
+        if self._gpu:
             try:
-                self._desc.deactivate(self._instance)
-                self._desc.cleanup(self._instance)
-            except Exception:
-                pass
-            self._instance = None
+                return DeepFilter(MODEL, gpu=True)
+            except Exception as e:
+                log.warning("NC: GPU unavailable, using CPU: %s", e)
+        return DeepFilter(MODEL)
 
     def _audio_callback(self, indata, outdata, frames, time_info, status):
         if status:
             log.debug("NC stream status: %s", status)
-        n = min(frames, FRAME_SIZE)
-        self._in_buf[:n] = indata[:n, 0]
-        raw = float(np.max(np.abs(self._in_buf[:n])))
-        self._desc.run(self._instance, n)
-        out = self._out_buf[:n]
+        x = indata[:, 0]
+        engine = self._engine                     # read once: set_gpu may swap it
+        try:
+            out = engine.process(x)
+        except Exception as e:
+            if engine.device != "GPU":
+                raise
+            # e.g. the GPU driver reset after a game crash: carry on on the CPU
+            log.warning("NC: GPU inference failed, switching to CPU: %s", e)
+            self._engine = engine = DeepFilter(MODEL)
+            out = engine.process(x)
+        raw = float(np.max(np.abs(x)))
         enhancer = self.enhancer                  # read once: the UI may swap it
         if enhancer.preset != "off":
             try:
@@ -340,14 +275,14 @@ class NoiseCanceller:
         proc = float(np.max(np.abs(out)))
         self._raw_peak = raw
         self._proc_peak = proc
-        outdata[:n, 0] = out
+        outdata[:, 0] = out
 
     def start(self):
         with self._lock:
             if not self._available or self._running:
                 return False
             try:
-                self._instance = self._create_instance()
+                self._engine = self._make_engine()
                 self._stream = sd.Stream(
                     samplerate=SAMPLE_RATE,
                     blocksize=FRAME_SIZE,
@@ -366,12 +301,16 @@ class NoiseCanceller:
                         _set_default_mic(True)
                     except Exception as e:
                         log.warning("NC: default mic switch failed: %s", e)
-                log.info("NC: started (%s -> %s)",
+                log.info("NC: started on %s (%s -> %s)", self._engine.device,
                          self._input_dev_name, self._output_dev_name)
                 return True
             except Exception as e:
                 log.error("NC start failed: %s", e)
-                self._destroy_instance()
+                if self._stream:
+                    self._stream.close()
+                    self._stream = None
+                self._engine = None
+                self._running = False
                 self._err = str(e)
                 return False
 
@@ -387,7 +326,7 @@ class NoiseCanceller:
                     self._stream = None
             except Exception:
                 pass
-            self._destroy_instance()
+            self._engine = None
             self._running = False
             self._paused = False
             self._raw_peak = 0.0
@@ -411,8 +350,8 @@ class NoiseCanceller:
         log.info("NC: mic enhancement -> %s", self.enhancer.preset)
 
     def pause(self):
-        """Headset off: stop the DSP (it costs ~30% of a core even on silence) but keep
-        the virtual mic as default and the 'on' setting, so resume() just restarts it."""
+        """Headset off: stop processing but keep the virtual mic as default and the 'on'
+        setting, so resume() just restarts it."""
         with self._lock:
             if not self._running or self._paused:
                 return

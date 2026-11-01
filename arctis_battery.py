@@ -858,7 +858,7 @@ class Badge:
             dts_line = f"\nDTS: {self.dts.preset_label}" if self.dts.enabled else "\nDTS: Off"
         else:
             dts_line = ""
-        nc_line = "\nNoise Cancel: On" if self.nc and self.nc.running else ""
+        nc_line = f"\nNoise Cancel: On ({self.nc.device})" if self.nc and self.nc.running else ""
         tk.Label(self.tip, text=f"Arctis 7\n{self.m.status_text()}\n{health_text(self.m.health)}{dts_line}{nc_line}",
                  justify="left", bg="#2b2b2b", fg="white", padx=10, pady=6,
                  font=("Segoe UI", 9)).pack()

@@ -17,7 +17,7 @@ mixer_apps.json
 # Copies of DTS's proprietary driver config: not ours to publish
 dts_apo4_*.xml*
 
-# DeepFilterNet LADSPA plugin (48 MB, downloaded at build time)
+# Old DeepFilterNet LADSPA plugin download, no longer used
 deep_filter_ladspa.dll
 
 # APO build artifacts (source in apo/ is tracked)

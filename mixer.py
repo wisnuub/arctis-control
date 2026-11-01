@@ -481,7 +481,10 @@ class MixerPanel:
                      font=(self.text_font, 9)).grid(row=r, column=1, sticky="w", pady=(12, 0))
             seg = tk.Frame(body, bg=BG)
             seg.grid(row=r, column=2, sticky="e", pady=(12, 0))
-            for key, label in [("off", "Off"), ("on", "On")]:
+            choices = [("off", "Off"), ("cpu", "CPU")]
+            if self.nc.gpu_available:
+                choices.append(("gpu", "GPU"))
+            for key, label in choices:
                 b = tk.Label(seg, text=label, bg="#2d2d2d", fg="white", padx=7, pady=2,
                              cursor="hand2", font=(self.text_font, 8))
                 b.pack(side="left", padx=(2, 0))
@@ -632,18 +635,21 @@ class MixerPanel:
     def paint_nc(self):
         if not self.nc_buttons:
             return
-        on = self.nc and self.nc.running
+        cur = self.nc.device.lower() if self.nc.running else "off"
         for key, b in self.nc_buttons.items():
-            active = (key == "on") == on
+            active = key == cur
             b.config(bg=ACCENT if active else "#2d2d2d", fg="black" if active else "white")
 
     def pick_nc(self, key):
+        """Off, or on with inference on the CPU or the GPU."""
         if not self.nc:
             return
-        if key == "on" and not self.nc.running:
-            self.nc.start()
-        elif key == "off" and self.nc.running:
+        if key == "off":
             self.nc.stop()
+        else:
+            if (key == "gpu") != (self.nc.device == "GPU"):
+                self.nc.set_gpu(key == "gpu")
+            self.nc.start()
         self.paint_nc()
         self.paint_enhance()
 
