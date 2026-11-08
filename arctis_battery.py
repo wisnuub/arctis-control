@@ -49,6 +49,8 @@ CHARGE_RISE = 3                   # level this far above a stretch's low = it wa
 SAG_DROP = 8                      # one-poll drop this big = voltage sag, not normal drain
 MIN_HOURS, MIN_DROP = 2, 5        # data needed before trusting the estimate
 UNPLUG_SETTLE = 3 * 60            # reading sags for a few minutes after unplugging
+SHOW_SETTLE = 10 * 60             # worn cell: keep the pre-charge level on the badge this long
+STUCK_AFTER = 3 * 3600            # on battery with no change this long: the gauge is stuck
 
 from paths import DATA_DIR, RES_DIR
 APP_ID = "Wisnu.ArctisControl"    # Windows app identity: toast name/icon, taskbar grouping
@@ -240,17 +242,18 @@ def health_text(h):
             f"(rated {RATED_HOURS} h){sag}{unplug}")
 
 
+def fmt_span(sec):
+    return f"{sec / 3600:.0f} h" if sec >= 5400 else f"{max(1, round(sec / 60))} min"
+
+
 def battery_log(rows, limit=300):
     """[(text, dim)] newest first: readings where the level or charger changed, with
     the gaps where the headset was off (or the app closed) marked."""
-    def span(sec):
-        return f"{sec / 3600:.0f} h" if sec >= 5400 else f"{sec / 60:.0f} min"
-
     out, prev = [], None
     for t, lvl, charging in rows:
         gap = prev and t - prev[0] > GAP_SECONDS
         if gap:
-            out.append((f"      off for {span(t - prev[0])}", True))
+            out.append((f"      off for {fmt_span(t - prev[0])}", True))
         if not prev or gap or lvl != prev[1] or charging != prev[2]:
             stamp = datetime.fromtimestamp(t).strftime("%a %d %b  %H:%M")
             out.append((f"{stamp}    {lvl}%{'    charging' if charging else ''}", False))
@@ -407,11 +410,18 @@ class Monitor:
             self.state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         except (FileNotFoundError, ValueError):
             self.state = {}
-        self.last_level = self.state.get("last_level")
+        # last level read on battery (charging readings run high): shown while the headset
+        # is off or charging. Seeded from the last unplugged reading in the history.
+        self.last_level = self.state.get("trusted_level")
         if self.last_level is None:
-            rows = load_history()
-            if rows:
-                self.last_level = rows[-1][1]
+            on_battery = [lvl for _, lvl, c in load_history() if c is False]
+            self.last_level = on_battery[-1] if on_battery else self.state.get("last_level")
+        self.state.pop("last_level", None)
+        self.raw_level = None                        # what the headset reports right now
+        self.prev_charging = None
+        self.plugged_at = self.unplugged_at = None   # time.time() of the last cable change
+        self.steady_raw, self.steady_since = None, None   # for spotting a stuck gauge
+        self.note = ""                               # why the shown level isn't the raw one
         self.wake = threading.Event()
         self.overlays = queue.SimpleQueue()          # (title, subtitle, style) for the UI thread
         self.turn_off_pending = False                # set from the UI thread
@@ -424,10 +434,39 @@ class Monitor:
         if not self.connected:
             last = f" · last {self.last_level}%" if self.last_level is not None else ""
             return f"Headset off{last} · {plug}"
+        if self.charging and self.plugged_at:
+            plug += f" for {fmt_span(time.time() - self.plugged_at)}"
+        if self.note:
+            return f"Battery {self.level}% ({self.note}) · {plug}"
         left = ""
         if self.health.get("rate") and not self.charging:
             left = f", ~{self.level / self.health['rate']:.0f} h left"
         return f"Battery {self.level}%{left} · {plug}"
+
+    def shown_level(self, raw, prev_connected):
+        """The level to show and alert on. The Arctis 7 reads battery voltage: it runs
+        high while charging, sags for minutes after unplugging (a lot, on a worn cell),
+        and after a reboot the headset can repeat an old value for hours. So hold the
+        last on-battery level through the first two and flag the third."""
+        now = time.time()
+        if self.charging:
+            self.note = "last reading on battery; it reads high while charging"
+            self.steady_raw = None
+            return self.last_level if self.last_level is not None else raw
+        if self.unplugged_at and now - self.unplugged_at < SHOW_SETTLE:
+            left = SHOW_SETTLE - (now - self.unplugged_at)
+            self.note = f"settling after unplugging, real reading in ~{fmt_span(left)}"
+            return self.last_level if self.last_level is not None else raw
+        if raw != self.steady_raw or not prev_connected:
+            self.steady_raw, self.steady_since = raw, now
+        stuck = now - self.steady_since
+        self.note = (f"unchanged for {fmt_span(stuck)}, the headset's gauge may be stuck"
+                     if stuck > STUCK_AFTER else "")
+        if self.last_level != raw:
+            self.last_level = raw
+            self.state["trusted_level"] = raw
+            STATE_FILE.write_text(json.dumps(self.state), encoding="utf-8")
+        return raw
 
     def popup(self, key, title, subtitle, style):
         """Queue a Steam-style popup if that event is switched on in Settings."""
@@ -514,8 +553,20 @@ class Monitor:
             logging.info("connected=%s level=%s charging=%s", connected, level, self.charging)
             self.last_raw = (connected, level, self.charging)
 
-        prev_connected, prev_level = self.connected, self.level
+        prev_connected, prev_level, prev_raw = self.connected, self.level, self.raw_level
+        if self.prev_charging is not None and self.charging != self.prev_charging:
+            if self.charging:
+                if not (self.plugged_at and self.unplugged_at
+                        and time.time() - self.unplugged_at < 60):   # a cable glitch
+                    self.plugged_at = time.time()
+            else:
+                self.unplugged_at = time.time()
+        self.prev_charging = self.charging
         self.connected = connected
+        self.raw_level = level if connected else None
+        if connected and level is not None:
+            self.record(level)                      # history keeps the raw readings
+            level = self.shown_level(level, prev_connected)
         self.level = level if connected else None
 
         if connected and prev_connected is False:
@@ -528,14 +579,12 @@ class Monitor:
             self.apply_auto_off()
 
         if connected and level is not None:
-            if self.last_level != level:
-                self.last_level = level
-                self.state["last_level"] = level
-                STATE_FILE.write_text(json.dumps(self.state), encoding="utf-8")
-            self.record(level)
-            self.check_alerts(level, prev_level)
+            self.check_alerts(level)
+            # the charger's own "full" is the only full signal there is
+            if self.charging and self.raw_level == 100 and prev_raw not in (None, 100):
+                self.popup("full", "Headset fully charged", "Arctis 7 · reads 100%", "full")
 
-    def check_alerts(self, level, prev_level):
+    def check_alerts(self, level):
         for t in THRESHOLDS:
             if level > t + REARM_MARGIN:
                 self.armed.add(t)
@@ -548,8 +597,6 @@ class Monitor:
             toast("Arctis 7 battery low" if not critical else "Arctis 7 battery critical",
                   f"{level}% left. Plug it in soon." if not critical
                   else f"{level}% left. It will shut off shortly.", loud=True)
-        if level == 100 and prev_level is not None and prev_level < 100:
-            self.popup("full", "Headset fully charged", "Arctis 7 · 100%", "full")
 
     def loop(self):
         """Every CABLE_POLL s: charging cable + headset on/off (either changing triggers
@@ -782,10 +829,10 @@ class Badge:
         self.root.after(1000, self.place)
 
     def refresh(self):
-        state = (self.m.connected, self.m.level, self.m.charging)
+        state = (self.m.connected, self.m.level, self.m.charging, bool(self.m.note))
         if state != self.shown:
             self.shown = state
-            connected, level, charging = state
+            connected, level, charging, held = state       # held: not a live reading
             online = connected and level is not None
             shown_level = level if online else self.m.last_level
             if self.icon_font:
@@ -803,7 +850,8 @@ class Badge:
             if online:
                 low = level <= 20 and not charging
                 self.base = LOW_BG if low else KEY
-                color = "white" if low else "#f2c94c" if level <= 50 else "white"
+                color = ("white" if low else "#9a9a9a" if held
+                         else "#f2c94c" if level <= 50 else "white")
                 self.canvas.itemconfig(self.label, text=f"{level}%", fill=color)
             else:
                 self.base = KEY
