@@ -35,8 +35,7 @@ DEFAULTS = {
     # not by the headset's own timer, which is kept at "never" so it can't cut music.
     "auto_off": True,
     "auto_off_minutes": 30,
-    "auto_off_applied": False,
-    "check_updates": True,    # False = set the headset's own timer to never on next connect
+    "check_updates": True,
 }
 AUTO_OFF_MAX = 240
 

@@ -243,7 +243,11 @@ def health_text(h):
 
 
 def fmt_span(sec):
-    return f"{sec / 3600:.0f} h" if sec >= 5400 else f"{max(1, round(sec / 60))} min"
+    minutes = max(1, round(sec / 60))
+    if minutes < 60:
+        return f"{minutes} min"
+    h, m = divmod(minutes, 60)
+    return f"{h} h {m} min" if m else f"{h} h"
 
 
 def battery_log(rows, limit=300):
@@ -420,22 +424,31 @@ class Monitor:
         self.raw_level = None                        # what the headset reports right now
         self.prev_charging = None
         self.plugged_at = self.unplugged_at = None   # time.time() of the last cable change
+        rows = load_history()
+        if rows and rows[-1][2] and time.time() - rows[-1][0] < GAP_SECONDS:
+            i = len(rows) - 1                        # restarted mid-charge: when did it start?
+            while i and rows[i - 1][2] and rows[i][0] - rows[i - 1][0] < GAP_SECONDS:
+                i -= 1
+            self.plugged_at = rows[i][0]
         self.steady_raw, self.steady_since = None, None   # for spotting a stuck gauge
         self.note = ""                               # why the shown level isn't the raw one
         self.wake = threading.Event()
         self.overlays = queue.SimpleQueue()          # (title, subtitle, style) for the UI thread
         self.turn_off_pending = False                # set from the UI thread
+        self.timer_ok = False                        # idle timer sent as never this connection
         self.off_requested_at = None                 # monotonic time the 1-min timer was armed
 
     def status_text(self):
         if self.connected is None:
             return "Checking…" if self.last_raw is None else "Dongle not found"
-        plug = "Charging" if self.charging else "Not charging"
+        last = f"{self.last_level}%" if self.last_level is not None else "unknown"
+        if self.charging:
+            since = f" for {fmt_span(time.time() - self.plugged_at)}" if self.plugged_at else ""
+            off = " · headset off" if not self.connected else ""
+            return f"Charging{since} · last on battery {last}{off}"
         if not self.connected:
-            last = f" · last {self.last_level}%" if self.last_level is not None else ""
-            return f"Headset off{last} · {plug}"
-        if self.charging and self.plugged_at:
-            plug += f" for {fmt_span(time.time() - self.plugged_at)}"
+            return f"Headset off · last {last} · Not charging"
+        plug = "Not charging"
         if self.note:
             return f"Battery {self.level}% ({self.note}) · {plug}"
         left = ""
@@ -474,13 +487,14 @@ class Monitor:
             self.overlays.put((title, subtitle, style))
 
     def apply_auto_off(self):
-        """Keep the headset's own idle timer at never; this app decides when to turn off."""
-        if SETTINGS.get("auto_off_applied") or self.off_requested_at:
+        """Keep the headset's own idle timer at never; this app decides when to turn off.
+        Sent on every connect: a reboot or flat battery could bring back the factory
+        timer, and it can't be read back to check."""
+        if self.timer_ok or self.off_requested_at:
             return
         try:
             if set_inactive_time(0):
-                SETTINGS["auto_off_applied"] = True
-                save_settings(SETTINGS)
+                self.timer_ok = True
                 logging.info("headset idle timer set to never")
         except Exception as e:
             logging.warning("idle timer write failed: %s", e)
@@ -497,8 +511,7 @@ class Monitor:
             self.turn_off_pending = False
             if self.connected and set_inactive_time(1):
                 self.off_requested_at = time.monotonic()
-                SETTINGS["auto_off_applied"] = False
-                save_settings(SETTINGS)
+                self.timer_ok = False
                 logging.info("turn-off requested (idle timer 1 min)")
                 self.overlays.put(("Turning off headset", "Arctis 7 · switches off within a minute",
                                    "off"))
@@ -577,6 +590,8 @@ class Monitor:
                        "off")
         if connected:
             self.apply_auto_off()
+        else:
+            self.timer_ok = False                   # re-send it when the headset is back
 
         if connected and level is not None:
             self.check_alerts(level)
@@ -847,7 +862,15 @@ class Badge:
                 self.canvas.itemconfig(self.batt, text="⚡" if charging else "")
             for item in (self.xdot, self.xmark):
                 self.canvas.itemconfig(item, state="hidden" if online else "normal")
-            if online:
+            # the reading on the charger is meaningless (voltage runs high), so just say so;
+            # hovering shows for how long and the last level on battery
+            self.canvas.itemconfig(self.batt, state="hidden" if charging else "normal")
+            self.canvas.coords(self.label, 34 if charging else 58, BADGE_H // 2 + 1)
+            self.canvas.itemconfig(self.label, font=(self.text_font, 10 if charging else 11))
+            if charging:
+                self.base = KEY
+                self.canvas.itemconfig(self.label, text="Charging", fill="#6ccb5f")
+            elif online:
                 low = level <= 20 and not charging
                 self.base = LOW_BG if low else KEY
                 color = ("white" if low else "#9a9a9a" if held
