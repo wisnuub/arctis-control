@@ -424,12 +424,16 @@ class Monitor:
         self.raw_level = None                        # what the headset reports right now
         self.prev_charging = None
         self.plugged_at = self.unplugged_at = None   # time.time() of the last cable change
-        rows = load_history()
+        rows = load_history()                        # restarted mid-charge or just after?
         if rows and rows[-1][2] and time.time() - rows[-1][0] < GAP_SECONDS:
-            i = len(rows) - 1                        # restarted mid-charge: when did it start?
+            i = len(rows) - 1
             while i and rows[i - 1][2] and rows[i][0] - rows[i - 1][0] < GAP_SECONDS:
                 i -= 1
             self.plugged_at = rows[i][0]
+        last_charge = next((i for i in range(len(rows) - 1, -1, -1) if rows[i][2]), None)
+        if last_charge is not None and last_charge + 1 < len(rows):
+            if time.time() - rows[last_charge + 1][0] < SHOW_SETTLE:
+                self.unplugged_at = rows[last_charge + 1][0]
         self.steady_raw, self.steady_since = None, None   # for spotting a stuck gauge
         self.note = ""                               # why the shown level isn't the raw one
         self.wake = threading.Event()
@@ -468,8 +472,8 @@ class Monitor:
             return self.last_level if self.last_level is not None else raw
         if self.unplugged_at and now - self.unplugged_at < SHOW_SETTLE:
             left = SHOW_SETTLE - (now - self.unplugged_at)
-            self.note = f"settling after unplugging, real reading in ~{fmt_span(left)}"
-            return self.last_level if self.last_level is not None else raw
+            self.note = f"just unplugged, may still drop for ~{fmt_span(left)}"
+            return raw                              # sags toward the truth; shown dimmed
         if raw != self.steady_raw or not prev_connected:
             self.steady_raw, self.steady_since = raw, now
         stuck = now - self.steady_since
